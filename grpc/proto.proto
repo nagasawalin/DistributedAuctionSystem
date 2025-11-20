@@ -1,0 +1,63 @@
+syntax = "proto3";
+option go_package = "auction/grpc";
+
+message BidAmount {
+    int64 id = 1;
+    int64 timestamp = 2;
+    int64 bid_amount = 3;
+}
+
+message BidAck {
+    bool accepted = 1;
+    int64 timestamp = 2;
+}
+
+message AuctionResult {
+    int64 highest_bid = 1;
+    int64 winner = 2;
+    int64 timestamp = 3;
+}
+
+message Empty {
+
+}
+
+message ReplicaUpdate {
+    int64 timestamp = 1;
+    int64 highest_bidder = 2;
+    int64 highest_bid = 3;
+    bool auction_finished = 4;
+    int64 request_identifier = 5;
+    BidAck response = 6;
+}
+
+message ReplicaIdentity {
+    int64 id = 1;
+    int64 timestamp = 2;
+}
+
+message ReplicaState {
+    ReplicaIdentity identity = 1;
+    int64 highest_bidder = 2;
+    int64 highest_bid = 3;
+    bool auction_finished = 4;
+}
+
+message ElectionResponse {
+    bool sender_greater = 1;
+}
+
+message Leader {
+    int64 id = 1;
+}
+
+service Auction {
+    rpc Bid (BidAmount) returns (BidAck);
+    rpc Result (Empty)  returns (AuctionResult);
+}
+
+service Replica {
+    rpc Update(ReplicaState) returns (Empty);
+    rpc StartElection (ReplicaIdentity) returns (ElectionResponse);
+    rpc ElectionFinished (Leader) returns (ReplicaState);
+}
