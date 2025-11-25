@@ -26,6 +26,7 @@ import (
 type AuctionService struct {
 	proto.UnimplementedAuctionServer
 	servers            map[int64]proto.AuctionClient
+	replicas           []*proto.ReplicaConnection
 	leader_id          int64
 	id                 int64
 	previous_responses map[int64]proto.AuctionResult
@@ -44,13 +45,14 @@ func main() {
 
 	log.SetOutput(f)*/
 	server := &AuctionService{
-		id:              1,
-		leader_id:       1,
+		id:              0,
+		leader_id:       0,
 		timestamp:       0,
 		highest_bid:     0,
-		highest_bidder:  -1,
+		highest_bidder:  -1, // -1 means no bidder
 		auction_running: false,
 		servers:         make(map[int64]proto.AuctionClient),
+		replicas:        make([]*proto.ReplicaConnection, 0),
 	}
 
 	server.start_server()
@@ -58,10 +60,40 @@ func main() {
 
 func (s *AuctionService) start_server() {
 	grpc_server := grpc.NewServer()
-	listener, err := net.Listen("tcp", ":8080")
 
-	if err != nil {
-		log.Fatal(err)
+	var listener net.Listener
+	var err error
+
+	for {
+		//as long as it can't connect keep increasing port number by 1
+		port := fmt.Sprintf(":%d", 8080+s.id)
+		listener, err = net.Listen("tcp", port)
+		if err == nil {
+			break
+		}
+		//create clients
+		conn, err := grpc.NewClient("localhost"+port, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			log.Fatal(err)
+		}
+		s.servers[s.id] = proto.NewAuctionClient(conn)
+		s.replicas = append(s.replicas, &proto.ReplicaConnection{
+			Id:   s.id,
+			Port: 8080 + s.id,
+		})
+		s.id++
+	}
+
+	if s.id != s.leader_id {
+		state, err := s.servers[s.leader_id].ReplicaConnected(context.Background(), &proto.ReplicaConnection{
+			Id:   s.id,
+			Port: 8080 + s.id,
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+		// Setup the replica with the leaders state
+		s.UpdateReplica(context.Background(), state)
 	}
 
 	proto.RegisterAuctionServer(grpc_server, s)
@@ -79,15 +111,18 @@ func (s *AuctionService) start_server() {
 
 func (s *AuctionService) start_auction() {
 	for {
+		log.Println("Auction started")
+		s.auction_running = true
 		s.highest_bid = 0
 		s.highest_bidder = -1
-		s.auction_running = true
-		log.Println("Auction started")
 		s.timestamp += 1
+		s.UpdateReplicas()
 		time.Sleep(time.Millisecond * time.Duration(10000))
+
 		log.Println("Auction over")
 		s.auction_running = false
 		s.timestamp += 1
+		s.UpdateReplicas()
 		time.Sleep(time.Second * 5)
 	}
 
@@ -124,10 +159,9 @@ func (s *AuctionService) Bid(ctx context.Context, bid *proto.BidAmount) (*proto.
 		log.Printf("Accepting bid from %d for %d", bid.Bidder, bid.BidAmount)
 		s.highest_bid = bid.BidAmount
 		s.highest_bidder = bid.Bidder
-		for _, server := range s.servers {
-			log.Printf("Updating server %d\n", server)
-			server.UpdateReplica(context.Background(), s.GetState())
-		}
+
+		s.UpdateReplicas()
+
 		return &proto.BidAck{Accepted: true}, nil
 	}
 	log.Printf("Declining bid from %d for %d", bid.Bidder, bid.BidAmount)
@@ -146,17 +180,7 @@ func (s *AuctionService) Result(ctx context.Context, _ *proto.Empty) (*proto.Auc
 func (s *AuctionService) ReplicaConnected(ctx context.Context, replica_info *proto.ReplicaConnection) (*proto.ReplicaState, error) {
 	if s.id != s.leader_id {
 		// Propogate to leader
-		state, err := s.servers[s.leader_id].ReplicaConnected(ctx, replica_info)
-		// If leader approves, add new connection to server map
-		if err == nil {
-			host_url := fmt.Sprintf("localhost:%d", replica_info.Port)
-			conn, err := grpc.NewClient(host_url, grpc.WithTransportCredentials(insecure.NewCredentials()))
-			if err != nil {
-				log.Fatal(err)
-			}
-			s.servers[replica_info.Id] = proto.NewAuctionClient(conn)
-		}
-		return state, err
+		return s.servers[s.leader_id].ReplicaConnected(ctx, replica_info)
 	}
 	_, occupied := s.servers[replica_info.Id]
 	if occupied {
@@ -168,15 +192,20 @@ func (s *AuctionService) ReplicaConnected(ctx context.Context, replica_info *pro
 		log.Fatal(err)
 	}
 	s.servers[replica_info.Id] = proto.NewAuctionClient(conn)
+	s.replicas = append(s.replicas, replica_info)
+
+	s.UpdateReplicas()
 
 	return s.GetState(), nil
 }
 
 func (s *AuctionService) UpdateReplica(ctx context.Context, state *proto.ReplicaState) (*proto.Empty, error) {
+	log.Println("Updating replica")
 	s.auction_running = !state.AuctionFinished
 	s.highest_bid = state.HighestBid
 	s.highest_bidder = state.HighestBidder
 	s.timestamp = state.Identity.Timestamp
+
 	return &proto.Empty{}, nil
 }
 
@@ -205,10 +234,7 @@ func (s *AuctionService) StartElection(ctx context.Context, identity *proto.Repl
 				}
 			}
 
-			// Update all of the other replicas with the newest state
-			for _, server := range s.servers {
-				go server.UpdateReplica(context.Background(), s.GetState())
-			}
+			s.UpdateReplicas()
 		}()
 	}
 	return &proto.ElectionResponse{SenderGreater: identity.Id > s.id}, nil
@@ -225,8 +251,16 @@ func (s *AuctionService) GetState() *proto.ReplicaState {
 			Id:        s.id,
 			Timestamp: s.timestamp,
 		},
+		Replicas:        s.replicas,
 		HighestBidder:   s.highest_bidder,
 		HighestBid:      s.highest_bid,
 		AuctionFinished: !s.auction_running,
+	}
+}
+
+func (s *AuctionService) UpdateReplicas() {
+	log.Println("Updating replicas")
+	for _, server := range s.servers {
+		go server.UpdateReplica(context.Background(), s.GetState())
 	}
 }
